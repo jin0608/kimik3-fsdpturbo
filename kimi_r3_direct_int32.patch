@@ -1,0 +1,146 @@
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -192,14 +192,15 @@
+                     )
+                 minimum = int(routed_experts.min().item()) if routed_experts.numel() else 0
+                 maximum = int(routed_experts.max().item()) if routed_experts.numel() else 0
+-                if minimum < 0 or maximum > 255:
++                if minimum < 0 or maximum > torch.iinfo(torch.int32).max:
+                     raise ValueError(
+-                        f"Kimi full-model route transport requires uint8 expert IDs, got min={minimum}, max={maximum}"
++                        f"Kimi full-model route transport requires non-negative int32 expert IDs, "
++                        f"got min={minimum}, max={maximum}"
+                     )
+                 # Preserve every vLLM model row. list_of_dict_to_tensordict
+                 # converts unequal row counts into a jagged tensor, so no
+                 # max-model-length padding is needed in TransferQueue.
+-                aligned = routed_experts.to(torch.uint8)
++                aligned = routed_experts.to(torch.int32)
+                 aligned_weights = routed_expert_weights
+             elif route_semantics is None:
+                 # Backward-compatible text-only routing uses absolute logical
+@@ -904,7 +905,7 @@
+                     self.model_config.hf_config,
+                 )
+                 routed_experts = torch.nested.as_nested_tensor(
+-                    [experts_tensor.to(torch.uint8)],
++                    [experts_tensor.to(torch.int32)],
+                     layout=torch.jagged,
+                 )
+                 routed_expert_weights = torch.nested.as_nested_tensor(
+diff --git a/verl/workers/utils/padding.py b/verl/workers/utils/padding.py
+--- a/verl/workers/utils/padding.py
++++ b/verl/workers/utils/padding.py
+@@ -112,8 +112,7 @@
+         }:
+             raise ValueError(f"unsupported routed-experts transport semantics: {route_semantics!r}")
+         full_model_transport = route_semantics == KIMI_FULL_MODEL_ROUTE_SEMANTICS
+-        if routed_experts.max() <= 255:
+-            routed_experts = routed_experts.to(torch.uint8)
++        routed_experts = routed_experts.to(torch.int32)
+         if full_model_transport:
+             # Kimi full R3 uses vLLM's image-expanded model-row axis, which is
+             # independent of tokenizer padding. Equal-length dense captures
+diff --git a/tests/experimental/agent_loop/test_agent_loop_extra_fields_schema_on_cpu.py b/tests/experimental/agent_loop/test_agent_loop_extra_fields_schema_on_cpu.py
+--- a/tests/experimental/agent_loop/test_agent_loop_extra_fields_schema_on_cpu.py
++++ b/tests/experimental/agent_loop/test_agent_loop_extra_fields_schema_on_cpu.py
+@@ -354,7 +354,8 @@
+ 
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize("full_r3", [False, True])
+-async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu(full_r3):
++@pytest.mark.parametrize("num_experts", [8, 896])
++async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu(full_r3, num_experts):
+     class _DummyWorker:
+         _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
+         _compute_position_ids = AgentLoopWorker._compute_position_ids
+@@ -373,9 +374,13 @@
+ 
+     worker = _DummyWorker()
+     worker.model_config = SimpleNamespace(
+-        hf_config=SimpleNamespace(model_type="kimi_k3", num_hidden_layers=2, num_experts=8, num_experts_per_token=1)
++        hf_config=SimpleNamespace(
++            model_type="kimi_k3", num_hidden_layers=2, num_experts=num_experts, num_experts_per_token=1
++        )
+     )
+     routed_experts = np.arange(8, dtype=np.int64).reshape(4, 2, 1)
++    if num_experts == 896:
++        routed_experts[-1, -1, -1] = 895
+     routed_experts.setflags(write=False)
+     assert not routed_experts.flags.writeable
+ 
+@@ -406,7 +411,7 @@
+     if full_r3:
+         assert internal.routed_experts.is_nested
+         torch.testing.assert_close(
+-            internal.routed_experts.values(), torch.tensor(routed_experts.copy()).to(torch.uint8)
++            internal.routed_experts.values(), torch.tensor(routed_experts.copy()).to(torch.int32)
+         )
+         torch.testing.assert_close(internal.routed_expert_weights.values(), torch.ones(4, 2, 1))
+         return
+@@ -474,3 +479,64 @@
+     # attention_mask should be all zeros
+     expected_attention_mask = torch.zeros((1, 8), dtype=torch.long)
+     torch.testing.assert_close(result["attention_mask"], expected_attention_mask)
++
++
++@pytest.mark.parametrize("maximum", [255, 256, 895])
++def test_full_r3_as_dict_int32_preserves_ids_and_weight_bits(maximum):
++    ids = torch.tensor([[[0, 1]], [[2, maximum]]], dtype=torch.int64)
++    weights = torch.tensor([[[0.25, 0.75]], [[0.5, 0.5]]], dtype=torch.bfloat16).float()
++    output = AgentLoopOutput(
++        prompt_ids=[101, 102],
++        response_ids=[11],
++        response_mask=[1],
++        routed_experts=ids,
++        routed_expert_weights=weights,
++        routed_experts_source_semantics=KIMI_FULL_MODEL_ROUTE_SEMANTICS,
++        metrics=AgentLoopMetrics(),
++    )
++    fields = output.as_dict()
++    assert fields["routed_experts"].dtype == torch.int32
++    assert torch.equal(fields["routed_experts"].long(), ids)
++    assert torch.equal(fields["routed_expert_weights"].view(torch.int32), weights.view(torch.int32))
++
++
++@pytest.mark.parametrize("invalid", [-1, 2147483648])
++def test_full_r3_as_dict_rejects_int32_overflow(invalid):
++    output = AgentLoopOutput(
++        prompt_ids=[101],
++        response_ids=[11],
++        response_mask=[1],
++        routed_experts=torch.tensor([[[invalid]]], dtype=torch.int64),
++        routed_expert_weights=torch.ones(1, 1, 1),
++        routed_experts_source_semantics=KIMI_FULL_MODEL_ROUTE_SEMANTICS,
++        metrics=AgentLoopMetrics(),
++    )
++    with pytest.raises(ValueError, match="non-negative int32 expert IDs"):
++        output.as_dict()
++
++
++@pytest.mark.parametrize("maximum", [3, 895])
++def test_padding_uses_int32_without_small_id_uint8_branch(maximum):
++    from tensordict import TensorDict
++
++    from verl.utils import tensordict_utils as tu
++    from verl.workers.utils.padding import left_right_2_no_padding
++
++    ids = torch.tensor([[[[0, 1]], [[2, maximum]]]], dtype=torch.int64)
++    weights = torch.full(ids.shape, 0.5)
++    data = TensorDict(
++        {
++            "input_ids": torch.tensor([[101, 11]]),
++            "attention_mask": torch.ones(1, 2, dtype=torch.int64),
++            "response_mask": torch.ones(1, 1, dtype=torch.int64),
++            "position_ids": torch.tensor([[0, 1]]),
++            "routed_experts": ids,
++            "routed_expert_weights": weights,
++        },
++        batch_size=[1],
++    )
++    tu.assign_non_tensor_data(data, "routed_experts_transport_semantics", KIMI_FULL_MODEL_ROUTE_SEMANTICS)
++    result = left_right_2_no_padding(data)
++    assert result["routed_experts"].dtype == torch.int32
++    assert torch.equal(result["routed_experts"].values().long(), ids.flatten(0, 1))
++    assert torch.equal(result["routed_expert_weights"].values().view(torch.int32), weights.flatten(0, 1).view(torch.int32))
