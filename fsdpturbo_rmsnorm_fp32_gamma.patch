@@ -1,0 +1,153 @@
+diff --git a/fsdp_turbo/ops/npu/rms_norm.py b/fsdp_turbo/ops/npu/rms_norm.py
+--- a/fsdp_turbo/ops/npu/rms_norm.py
++++ b/fsdp_turbo/ops/npu/rms_norm.py
+@@ -1,4 +1,6 @@
+ # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
++import torch
++
+ from fsdp_turbo.ops.registry import register_op
+ 
+ try:
+@@ -9,4 +11,8 @@
+ 
+ @register_op('rms_norm', 'npu')
+ def rms_norm_npu(x, weight, eps):
++    # CANN does not support FP32 activations with BF16 gamma. Promote only
++    # the temporary gamma tensor: preserve x, parameter storage and autograd.
++    if x.dtype == torch.float32 and weight.dtype == torch.bfloat16:
++        weight = weight.float()
+     return torch_npu.npu_rms_norm(x, weight, epsilon=eps)[0]
+diff --git a/tests/unit_tests/ops/test_npu_rms_norm.py b/tests/unit_tests/ops/test_npu_rms_norm.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit_tests/ops/test_npu_rms_norm.py
+@@ -0,0 +1,129 @@
++"""Test the actual adapter body without importing unrelated FSDP/NPU modules."""
++import ast
++from pathlib import Path
++from types import ModuleType
++
++import pytest
++import torch
++
++
++def _load_adapter():
++    path = Path(__file__).parents[3] / "fsdp_turbo/ops/npu/rms_norm.py"
++    tree = ast.parse(path.read_text())
++    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "rms_norm_npu")
++    function.decorator_list = []
++    module = ModuleType("isolated_npu_rms_norm_adapter")
++    module.torch = torch
++    module.torch_npu = None
++    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), module.__dict__)
++    return module
++
++
++def _reference(x, weight, eps):
++    input_dtype = x.dtype
++    x = x.float()
++    variance = x.pow(2).mean(-1, keepdim=True)
++    return (weight * (x * torch.rsqrt(variance + eps))).to(input_dtype)
++
++
++@pytest.mark.parametrize(
++    "input_dtype,weight_dtype",
++    [
++        (torch.float32, torch.bfloat16),
++        (torch.float32, torch.float32),
++        (torch.bfloat16, torch.bfloat16),
++        (torch.bfloat16, torch.float32),
++        (torch.float16, torch.float32),
++        (torch.float16, torch.float16),
++    ],
++)
++def test_rms_norm_adapter_only_promotes_unsupported_pair(input_dtype, weight_dtype):
++    adapter = _load_adapter()
++    x = torch.tensor([[0.3, -0.7, 1.1, 2.3]], dtype=input_dtype)
++    weight = torch.nn.Parameter(torch.tensor([0.5, 1.25, -0.75, 2.0], dtype=weight_dtype))
++    original_weight = weight.detach().clone()
++    original_storage = weight.data_ptr()
++    eps = 1e-6
++    calls = []
++
++    class FakeNPU:
++        @staticmethod
++        def npu_rms_norm(value, gamma, epsilon):
++            calls.append((value, gamma, epsilon))
++            return (_reference(value, gamma, epsilon), None)
++
++    adapter.torch_npu = FakeNPU
++    result = adapter.rms_norm_npu(x, weight, eps)
++    value, gamma, epsilon = calls[0]
++    assert value is x
++    assert epsilon == eps
++    if input_dtype == torch.float32 and weight_dtype == torch.bfloat16:
++        assert gamma.dtype == torch.float32
++        assert gamma is not weight
++        assert gamma.grad_fn is not None
++        assert torch.equal(gamma, weight.float())
++    else:
++        assert gamma is weight
++    assert weight.dtype == weight_dtype
++    assert weight.data_ptr() == original_storage
++    assert torch.equal(weight, original_weight)
++    assert result.dtype == x.dtype
++    torch.testing.assert_close(result, _reference(x, weight, eps), rtol=0, atol=0)
++
++
++def test_promoted_gamma_keeps_autograd_connected_to_bf16_parameter():
++    adapter = _load_adapter()
++
++    class FakeNPU:
++        @staticmethod
++        def npu_rms_norm(x, gamma, epsilon):
++            assert x.dtype == gamma.dtype == torch.float32
++            return (_reference(x, gamma, epsilon), None)
++
++    adapter.torch_npu = FakeNPU
++    generator = torch.Generator().manual_seed(17)
++    x = torch.randn(3, 16, generator=generator).requires_grad_()
++    weight = torch.nn.Parameter(torch.randn(16, generator=generator).bfloat16())
++    x_ref = x.detach().clone().requires_grad_()
++    weight_ref = torch.nn.Parameter(weight.detach().clone())
++    probe = torch.randn(3, 16, generator=generator)
++    actual = adapter.rms_norm_npu(x, weight, 1e-6)
++    # Use an explicit FP32 compute reference. This tests the cast's gradient
++    # path; it does not assume identical reduction rounding for mixed-dtype
++    # eager operations or the real fused CANN backward.
++    reference = _reference(x_ref, weight_ref.float(), 1e-6)
++    (actual * probe).sum().backward()
++    (reference * probe).sum().backward()
++    for left, right in ((actual, reference), (x.grad, x_ref.grad), (weight.grad, weight_ref.grad)):
++        torch.testing.assert_close(left, right, rtol=0, atol=0)
++    assert weight.grad is not None
++    assert weight.grad.dtype == torch.bfloat16
++    assert torch.count_nonzero(weight.grad) > 0
++
++
++def test_real_npu_rms_norm_matches_fp32_reference():
++    torch_npu = pytest.importorskip("torch_npu")
++    if not torch.npu.is_available():
++        pytest.skip("NPU hardware is required")
++    adapter = _load_adapter()
++    adapter.torch_npu = torch_npu
++    generator = torch.Generator().manual_seed(17)
++    x = torch.randn(4, 128, generator=generator).to("npu").requires_grad_()
++    weight = torch.nn.Parameter(torch.randn(128, generator=generator).to(device="npu", dtype=torch.bfloat16))
++    x_ref = x.detach().clone().requires_grad_()
++    weight_ref = torch.nn.Parameter(weight.detach().clone())
++    probe = torch.randn(4, 128, generator=generator).to("npu")
++    # Keep the reference in FP32 even under a surrounding training autocast.
++    with torch.autocast(device_type="npu", enabled=False):
++        actual = adapter.rms_norm_npu(x, weight, 1e-6)
++        reference = _reference(x_ref, weight_ref.float(), 1e-6)
++        (actual * probe).sum().backward()
++        (reference * probe).sum().backward()
++    assert actual.dtype == torch.float32
++    assert weight.dtype == torch.bfloat16
++    assert weight.grad is not None and weight.grad.dtype == torch.bfloat16
++    # These are numerical tolerances, not a claim of bitwise equivalence
++    # between the fused CANN kernel and eager reductions.
++    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-6)
++    torch.testing.assert_close(x.grad, x_ref.grad, rtol=1e-4, atol=1e-5)
++    torch.testing.assert_close(weight.grad.float(), weight_ref.grad.float(), rtol=1e-2, atol=1e-3)
