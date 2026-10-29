@@ -1,0 +1,350 @@
+diff --git a/tests/utils/test_kimi_cp_config_on_cpu.py b/tests/utils/test_kimi_cp_config_on_cpu.py
+new file mode 100644
+--- /dev/null
++++ b/tests/utils/test_kimi_cp_config_on_cpu.py
+@@ -0,0 +1,43 @@
++from types import SimpleNamespace
++
++import pytest
++
++from verl.utils.kimi_cp_config import configure_kimi_post_fusion_cp
++
++
++def test_cp1_is_unchanged():
++    config = {"distributed": {"ulysses_parallel_size": 1}}
++    assert not configure_kimi_post_fusion_cp(config, SimpleNamespace(model_type="kimi_k3"))
++    assert config == {"distributed": {"ulysses_parallel_size": 1}}
++
++
++def test_install_complete_plan_idempotently():
++    config = {"distributed": {"ulysses_parallel_size": 2, "fully_shard_parallel_size": 4}}
++    hf = SimpleNamespace(model_type="kimi_k3")
++    assert configure_kimi_post_fusion_cp(config, hf)
++    assert configure_kimi_post_fusion_cp(config, hf)
++    plan = config["distributed"]["cp_plan"]
++    assert len(plan["ulysses_function_patches"]) == 2
++    assert len(plan["loss_function_patches"]) == 1
++    assert len(config["module_patches"]) == 1
++
++
++def test_conflicting_forward_is_rejected():
++    config = {"distributed": {"ulysses_parallel_size": 2, "fully_shard_parallel_size": 4}, "module_patches": [
++        {"target": "modeling_kimi_k3.KimiK3ForConditionalGeneration.forward", "replacement": "other.forward"}
++    ]}
++    with pytest.raises(ValueError, match="Conflicting"):
++        configure_kimi_post_fusion_cp(config, SimpleNamespace(model_type="kimi_k3"))
++
++
++@pytest.mark.parametrize("key", ["tensor_parallel_size", "kv_allgather_parallel_size"])
++def test_unsupported_hybrid_fails_before_model_build(key):
++    config = {"distributed": {"ulysses_parallel_size": 2, key: 2}}
++    with pytest.raises(ValueError):
++        configure_kimi_post_fusion_cp(config, SimpleNamespace(model_type="kimi_k3"))
++
++
++def test_cp_group_must_be_inside_fsdp_averaging_group():
++    config = {"distributed": {"ulysses_parallel_size": 4, "fully_shard_parallel_size": 2}}
++    with pytest.raises(ValueError, match="averaging group"):
++        configure_kimi_post_fusion_cp(config, SimpleNamespace(model_type="kimi_k3"))
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -1570,6 +1570,13 @@
+ 
+         # Upsampling the batch with padding sequences
+         batch_multiple = self._get_required_batch_multiple(dp_size)
++        # Reject missing/extra trajectories before any synthetic text is inserted.
++        # Zero loss on synthetic samples cannot prevent divergent vision branches.
++        from verl.utils.turbo_cp_batch import validate_turbo_cp_runtime_batch
++
++        validate_turbo_cp_runtime_batch(
++            self.config, dp_size=dp_size, tags=batch.tags, required_multiple=batch_multiple
++        )
+         batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
+         global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
+         workload_lst = calculate_workload(global_seqlen_lst)
+diff --git a/verl/utils/config.py b/verl/utils/config.py
+--- a/verl/utils/config.py
++++ b/verl/utils/config.py
+@@ -86,6 +86,17 @@
+     # number of GPUs total
+     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+ 
++    # Turbo CP has fewer independent data groups than physical accelerators.
++    # Validate the complete static schedule rather than bypassing this check.
++    from verl.utils.turbo_cp_batch import validate_turbo_cp_batch_config
++
++    turbo_cp_batch = validate_turbo_cp_batch_config(config, use_reference_policy=use_reference_policy)
++    if turbo_cp_batch is not None:
++        print(
++            f"[Turbo CP batch] world={n_gpus}, CP={turbo_cp_batch['cp_size']}, "
++            f"data_groups={turbo_cp_batch['dp_size']}; synthetic trajectory padding disabled"
++        )
++
+     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
+         if config.actor_rollout_ref.actor.strategy == "megatron":
+             model_parallel_size = (
+@@ -102,6 +113,8 @@
+                 model_parallel_size * config.actor_rollout_ref.actor.megatron.context_parallel_size
+             )
+             minimal_bsz = megatron_dp * config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
++        elif turbo_cp_batch is not None:
++            minimal_bsz = turbo_cp_batch["dp_size"]
+         else:
+             minimal_bsz = n_gpus
+ 
+diff --git a/verl/utils/kimi_cp_config.py b/verl/utils/kimi_cp_config.py
+new file mode 100644
+--- /dev/null
++++ b/verl/utils/kimi_cp_config.py
+@@ -0,0 +1,46 @@
++# Copyright 2026 Huawei Technologies Co., Ltd.
++# Licensed under the Apache License, Version 2.0.
++"""Install the complete Kimi post-fusion CP plan before Turbo validates it."""
++
++
++def configure_kimi_post_fusion_cp(turbo_config, hf_config):
++    distributed = turbo_config.setdefault("distributed", {})
++    cp_size = int(distributed.get("ulysses_parallel_size", 1))
++    if getattr(hf_config, "model_type", None) != "kimi_k3" or cp_size <= 1:
++        return False
++    if int(distributed.get("kv_allgather_parallel_size", 1)) != 1:
++        raise ValueError("Kimi VERL CP currently supports Ulysses only, not hybrid KV-AllGather CP")
++    if int(distributed.get("tensor_parallel_size", 1)) != 1:
++        raise ValueError("Kimi VERL post-fusion CP currently requires training TP=1")
++    fsdp_size = int(distributed.get("fully_shard_parallel_size", 1))
++    if fsdp_size % cp_size != 0:
++        raise ValueError("Kimi RL CP requires the contiguous CP group inside the FSDP averaging group")
++
++    cp_plan = distributed.setdefault("cp_plan", {})
++    for key, target, kind in (
++        ("ulysses_function_patches", "modeling_kimi_linear.eager_attention_forward", "full_attention"),
++        ("ulysses_function_patches", "modeling_kimi_linear.KimiDeltaAttention.forward", "kda"),
++        ("loss_function_patches", "transformers.loss.loss_utils.ForCausalLMLoss", "causal_lm_loss"),
++    ):
++        entries = cp_plan.setdefault(key, [])
++        if not isinstance(entries, list):
++            raise ValueError(f"Kimi VERL CP requires {key} as a list of explicit patch mappings")
++        existing = [entry for entry in entries if target in entry.get("target_functions", [])]
++        if existing:
++            if len(existing) != 1 or existing[0].get("type") != kind:
++                raise ValueError(f"Conflicting Kimi CP function patch for {target}")
++        else:
++            entries.append({"target_functions": [target], "type": kind})
++
++    target = "modeling_kimi_k3.KimiK3ForConditionalGeneration.forward"
++    replacement = "fsdp_turbo.models.kimi.kimi_k3_cp.kimi_k3_model_forward"
++    entries = turbo_config.setdefault("module_patches", [])
++    if not isinstance(entries, list):
++        raise ValueError("Kimi VERL CP requires module_patches as a list")
++    existing = [entry for entry in entries if entry.get("target") == target]
++    if existing:
++        if len(existing) != 1 or existing[0].get("replacement") != replacement:
++            raise ValueError("Conflicting Kimi post-fusion model forward patch")
++    else:
++        entries.append({"target": target, "replacement": replacement})
++    return True
+diff --git a/verl/utils/turbo_cp_batch.py b/verl/utils/turbo_cp_batch.py
+new file mode 100644
+--- /dev/null
++++ b/verl/utils/turbo_cp_batch.py
+@@ -0,0 +1,142 @@
++# Copyright 2026 Huawei Technologies Co., Ltd.
++# Licensed under the Apache License, Version 2.0.
++"""Turbo Ulysses CP batch validation; never manufacture trajectories.
++
++This module does not import torch, Ray, or FSDPTurbo. Model math and gradient
++normalization remain owned by the existing CP bridge and training engine.
++"""
++
++
++def _get(obj, key, default=None):
++    if hasattr(obj, "get"):
++        return obj.get(key, default)
++    return getattr(obj, key, default)
++
++
++def _positive(value, name):
++    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
++        raise ValueError(f"Turbo CP requires {name} to be a positive integer, got {value!r}")
++    return value
++
++
++def _distributed(role):
++    # ActorRolloutRefWorker passes fsdp_config as the engine configuration.
++    return _get(_get(_get(role, "fsdp_config", {}), "turbo_config", {}), "distributed", {})
++
++
++def get_turbo_cp_batch_layout(config):
++    """Return the supported CP layout, or None to preserve non-CP behavior."""
++    arr = _get(config, "actor_rollout_ref")
++    actor = _get(arr, "actor")
++    if _get(actor, "strategy") != "fsdp_turbo":
++        return None
++    distributed = _distributed(actor)
++    cp_size = _positive(_get(distributed, "ulysses_parallel_size", 1), "CP size")
++    if cp_size == 1:
++        return None
++    for name in ("tensor_parallel_size", "kv_allgather_parallel_size"):
++        if _get(distributed, name, 1) != 1:
++            raise ValueError(f"Turbo CP small-batch path requires {name}=1")
++    if _get(actor, "ulysses_sequence_parallel_size", 1) != 1:
++        raise ValueError("Use Turbo CP only; actor.ulysses_sequence_parallel_size must remain 1")
++    trainer = _get(config, "trainer")
++    world_size = _positive(_get(trainer, "nnodes"), "trainer.nnodes") * _positive(
++        _get(trainer, "n_gpus_per_node"), "trainer.n_gpus_per_node"
++    )
++    if world_size % cp_size:
++        raise ValueError(f"Turbo CP world size {world_size} must be divisible by CP size {cp_size}")
++    fsdp_size = _positive(_get(distributed, "fully_shard_parallel_size", 1), "FSDP size")
++    if world_size % fsdp_size or fsdp_size % cp_size:
++        raise ValueError("Turbo CP requires CP groups contained in the FSDP averaging group")
++    return {"world_size": world_size, "cp_size": cp_size, "dp_size": world_size // cp_size}
++
++
++def validate_turbo_cp_batch_config(config, *, use_reference_policy):
++    """Validate global batches and the microbatch mode selected by each worker."""
++    layout = get_turbo_cp_batch_layout(config)
++    if layout is None:
++        return None
++    arr = _get(config, "actor_rollout_ref")
++    actor, rollout, ref = (_get(arr, name) for name in ("actor", "rollout", "ref"))
++    actor_dynamic = _get(actor, "use_dynamic_bsz", False)
++    rollout_dynamic = _get(rollout, "log_prob_use_dynamic_bsz", False)
++    # ActorRolloutRefWorker uses a single engine mode for actor and old log-prob.
++    # Match its existing assertion, but do not require that mode to be static.
++    if actor_dynamic != rollout_dynamic:
++        raise ValueError("Turbo CP requires actor.use_dynamic_bsz == rollout.log_prob_use_dynamic_bsz")
++    if use_reference_policy:
++        ref_distributed = _distributed(ref)
++        if _get(ref, "strategy") != "fsdp_turbo" or any(
++            _get(ref_distributed, name, 1) != value for name, value in (
++                ("ulysses_parallel_size", layout["cp_size"]),
++                ("tensor_parallel_size", 1), ("kv_allgather_parallel_size", 1),
++            )
++        ):
++            raise ValueError("Turbo CP reference must use the same CP data layout as actor (TP=1, KV-AllGather=1)")
++        ref_fsdp = _positive(_get(ref_distributed, "fully_shard_parallel_size", 1), "reference FSDP size")
++        if layout["world_size"] % ref_fsdp or ref_fsdp % layout["cp_size"]:
++            raise ValueError("Turbo CP reference CP group must be contained in its FSDP averaging group")
++        if _get(ref, "ulysses_sequence_parallel_size", 1) != 1:
++            raise ValueError("Turbo CP reference.ulysses_sequence_parallel_size must remain 1")
++    prompts = _positive(_get(_get(config, "data"), "train_batch_size"), "train_batch_size")
++    repeats = _positive(_get(rollout, "n"), "rollout.n")
++    mini_prompts = _positive(_get(actor, "ppo_mini_batch_size"), "ppo_mini_batch_size")
++    batch, mini, dp_size = prompts * repeats, mini_prompts * repeats, layout["dp_size"]
++    if batch % dp_size or mini % dp_size or batch % mini:
++        raise ValueError(
++            f"Turbo CP requires real answers B=P*n={batch} and mini answers G=M*n={mini} "
++            f"divisible by actual data groups D={dp_size}, and B divisible by G; "
++            "synthetic text padding is forbidden"
++        )
++    checks = [(actor, "ppo_micro_batch_size_per_gpu", "ppo_max_token_len_per_gpu",
++               mini // dp_size, "actor", actor_dynamic),
++              (rollout, "log_prob_micro_batch_size_per_gpu", "log_prob_max_token_len_per_gpu",
++               batch // dp_size, "rollout log-prob", rollout_dynamic)]
++    if use_reference_policy:
++        checks.append((ref, "log_prob_micro_batch_size_per_gpu", "log_prob_max_token_len_per_gpu",
++                       batch // dp_size, "reference log-prob", _get(ref, "log_prob_use_dynamic_bsz", False)))
++    for role, name, token_name, local_size, label, dynamic in checks:
++        if dynamic:
++            # Dynamic scheduling uses the existing token budget and synchronized
++            # planner. A fixed microbatch is unused and must not constrain it.
++            _positive(_get(role, token_name), f"{label}.{token_name}")
++            continue
++        legacy = name.removesuffix("_per_gpu")
++        if _get(role, legacy) is not None:
++            raise ValueError(f"Turbo CP requires {label}.{legacy}=None; use {name}")
++        micro = _positive(_get(role, name), f"{label}.{name}")
++        if local_size % micro:
++            raise ValueError(f"Turbo CP {label}: local samples {local_size} must be divisible by microbatch {micro}")
++    return layout
++
++
++def validate_turbo_cp_runtime_batch(config, *, dp_size, tags, required_multiple):
++    """Fail on controller before padding/dispatch, including incomplete batches."""
++    layout = get_turbo_cp_batch_layout(config)
++    if layout is None:
++        return
++    if dp_size != layout["dp_size"]:
++        raise ValueError(f"Turbo CP actual data groups {dp_size} disagree with configured {layout['dp_size']}")
++    _positive(required_multiple, "runtime batch multiple")
++    count = len(tags)
++    arr = _get(config, "actor_rollout_ref")
++    expected = _get(_get(config, "data"), "train_batch_size") * _get(_get(arr, "rollout"), "n")
++    if count != expected or count % required_multiple or any(tag.get("is_padding", False) for tag in tags):
++        raise ValueError(
++            f"Turbo CP refuses synthetic padding before dispatch: got {count} trajectories, "
++            f"expected {expected}, required multiple {required_multiple}, D={dp_size}. "
++            "Use complete real trajectory batches; zero-loss text padding can diverge from image branches."
++        )
++    # Protect actual log-prob schedules even if an upstream sampler changes batch size.
++    arr = _get(config, "actor_rollout_ref")
++    rollout = _get(arr, "rollout")
++    role_checks = [(rollout, "rollout")]
++    actor = _get(arr, "actor")
++    if _get(actor, "use_kl_loss", False) or _get(_get(config, "algorithm", {}), "use_kl_in_reward", False):
++        role_checks.append((_get(arr, "ref"), "reference"))
++    for role, label in role_checks:
++        if _get(role, "log_prob_use_dynamic_bsz", False):
++            continue
++        micro = _positive(_get(role, "log_prob_micro_batch_size_per_gpu"), f"{label} log-prob microbatch")
++        if (count // dp_size) % micro:
++            raise ValueError(f"Turbo CP runtime {label} local batch cannot be evenly split into microbatches")
+diff --git a/verl/workers/engine/fsdp/fsdp_turbo_impl.py b/verl/workers/engine/fsdp/fsdp_turbo_impl.py
+--- a/verl/workers/engine/fsdp/fsdp_turbo_impl.py
++++ b/verl/workers/engine/fsdp/fsdp_turbo_impl.py
+@@ -39,6 +39,16 @@
+         from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig, _dict_to_dataclass
+ 
+         turbo_config = copy.deepcopy(self.engine_config.turbo_config)
++        from verl.utils.kimi_cp_config import configure_kimi_post_fusion_cp
++
++        self._kimi_post_fusion_cp = configure_kimi_post_fusion_cp(turbo_config, self.model_config.hf_config)
++        if self._kimi_post_fusion_cp:
++            import inspect
++
++            from fsdp_turbo.models.kimi.kimi_k3_cp import kimi_k3_model_forward
++
++            if "cp_gather_hidden_states" not in inspect.signature(kimi_k3_model_forward).parameters:
++                raise RuntimeError("Kimi RL CP requires the matching FSDPTurbo CP bridge patch in the loaded runtime")
+         fsdp_plan = turbo_config.setdefault("distributed", {}).setdefault("fsdp_plan", {})
+         cpu_offload = bool(self.engine_config.offload_policy or self.engine_config.forward_only)
+         fsdp_plan["cpu_offload"] = cpu_offload
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -1343,6 +1343,12 @@
+         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
+         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+         use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
++        kimi_post_fusion_cp = bool(getattr(self, "_kimi_post_fusion_cp", False) and self.use_ulysses_sp)
++        if kimi_post_fusion_cp and (use_remove_padding or use_fused_kernels):
++            raise NotImplementedError(
++                "Kimi post-fusion CP requires use_remove_padding=False and use_fused_kernels=False; "
++                "the complete raw sequence must reach image expansion before CP slicing"
++            )
+         temperature = micro_batch["temperature"]
+         temperature_item = temperature
+         temperature_is_one = _is_scalar_unit_temperature(temperature)
+@@ -1626,13 +1632,19 @@
+         model_inputs.update(multi_modal_inputs)
+         model_inputs.update(extra_args)
+ 
++        if kimi_post_fusion_cp:
++            # The decoder is sharded, but gather its hidden states before the
++            # replicated head. Keep CP1's image-logit mapping, temperature,
++            # entropy, global causal shift and RL loss normalization unchanged.
++            model_inputs["cp_gather_hidden_states"] = True
++
+         logits_to_input_indices = kimi_k3_logits_to_input_indices(
+             model_inputs["input_ids"], multi_modal_inputs, self.model_config.hf_config
+         )
+         if logits_to_input_indices is not None:
+             if use_fused_kernels:
+                 raise NotImplementedError("Kimi K3 image-expanded logits are not supported by fused log-prob kernels")
+-            if self.use_ulysses_sp:
++            if self.use_ulysses_sp and not kimi_post_fusion_cp:
+                 raise NotImplementedError("Kimi K3 image-expanded logit alignment is not implemented with Ulysses SP")
+             output_args["logits_to_input_indices"] = logits_to_input_indices
+ 
