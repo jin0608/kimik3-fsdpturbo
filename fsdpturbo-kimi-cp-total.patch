@@ -1,0 +1,561 @@
+diff --git a/fsdp_turbo/distributed/context_parallel/batch.py b/fsdp_turbo/distributed/context_parallel/batch.py
+--- a/fsdp_turbo/distributed/context_parallel/batch.py
++++ b/fsdp_turbo/distributed/context_parallel/batch.py
+@@ -11,6 +11,40 @@
+     "attention_mask": 0,
+     "mm_token_type_ids": 0,
+ }
++
++
++class _GatherFusedHiddenStates(torch.autograd.Function):
++    """Replicated RL loss, sequence-sharded decoder, FSDP-averaged gradients.
++
++    Every CP rank computes the same full-sequence loss. Return only this
++    rank's sequence gradient, multiplied by CP size to compensate the later
++    FSDP gradient average over the CP ranks. Do not scale the replicated head.
++    """
++
++    @staticmethod
++    def forward(ctx, hidden_states, group):
++        ctx.group_size = dist.get_world_size(group)
++        ctx.rank = dist.get_rank(group)
++        ctx.local_length = hidden_states.shape[1]
++        parts = [torch.empty_like(hidden_states) for _ in range(ctx.group_size)]
++        dist.all_gather(parts, hidden_states.contiguous(), group=group)
++        return torch.cat(parts, dim=1)
++
++    @staticmethod
++    def backward(ctx, grad_output):
++        start = ctx.rank * ctx.local_length
++        grad = grad_output.narrow(1, start, ctx.local_length).contiguous()
++        return grad * ctx.group_size, None
++
++
++def gather_fused_sequence_hidden_states(hidden_states, group, complete_length):
++    """Gather hidden states, not vocabulary logits; remove only CP padding."""
++    if dist.get_world_size(group) == 1:
++        return hidden_states[:, :complete_length]
++    full = _GatherFusedHiddenStates.apply(hidden_states, group)
++    if complete_length > full.shape[1] or complete_length <= full.shape[1] - dist.get_world_size(group):
++        raise ValueError("Decoder hidden-state length does not match the post-fusion CP layout")
++    return full[:, :complete_length]
+ 
+ 
+ def sequence_parallel_range(seq_len: int, group):
+diff --git a/fsdp_turbo/models/kimi/kimi_k3_cp.py b/fsdp_turbo/models/kimi/kimi_k3_cp.py
+--- a/fsdp_turbo/models/kimi/kimi_k3_cp.py
++++ b/fsdp_turbo/models/kimi/kimi_k3_cp.py
+@@ -4,8 +4,14 @@
+ import torch
+ from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
+ 
+-from fsdp_turbo.distributed.context_parallel.batch import shard_fused_sequence_inputs
++from fsdp_turbo.distributed.context_parallel.batch import (
++    gather_fused_sequence_hidden_states,
++    pad_tensor_to_group,
++    shard_fused_sequence_inputs,
++    split_tensor_to_group,
++)
+ from fsdp_turbo.distributed.context_parallel.ulysses.utils import get_ulysses_context
++from fsdp_turbo.models.kimi.kimi_r3_utils import align_kimi_full_model_routes
+ 
+ 
+ def _build_position_ids(inputs_embeds, attention_mask):
+@@ -44,6 +50,11 @@
+     output_hidden_states: bool | None = None,
+     return_dict: bool | None = None,
+     cache_position: torch.LongTensor | None = None,
++    routed_experts: torch.Tensor | None = None,
++    routed_expert_weights: torch.Tensor | None = None,
++    router_replay_mask: torch.Tensor | None = None,
++    r3_full_model_rows: bool = False,
++    cp_gather_hidden_states: bool = False,
+     **kwargs,
+ ):
+     """Fuse Kimi multimodal inputs completely, then shard the language sequence."""
+@@ -90,8 +101,19 @@
+         position_ids = _build_position_ids(inputs_embeds, attention_mask)
+ 
+     complete_attention_mask = attention_mask
++    complete_length = inputs_embeds.shape[1]
+     complete_labels = _mask_labels(labels, complete_attention_mask, self.config.ignore_index)
+     num_items_in_batch = kwargs.pop("num_items_in_batch", None)
++    replay_inputs = (routed_experts, routed_expert_weights, router_replay_mask)
++    if any(value is not None for value in replay_inputs):
++        if any(value is None for value in replay_inputs) or not r3_full_model_rows:
++            raise ValueError("Kimi CP R3 requires IDs, weights, mask and natural-rollout full-model semantics")
++        # Rollout has one fewer row than the complete training sequence. Align
++        # before sharding: otherwise the last-token gap is incorrectly applied
++        # once per CP shard and image rows can silently shift.
++        routed_experts, routed_expert_weights, router_replay_mask = align_kimi_full_model_routes(
++            routed_experts, routed_expert_weights, router_replay_mask, complete_attention_mask
++        )
+     if ulysses_size > 1:
+         inputs_embeds, position_ids, attention_mask = shard_fused_sequence_inputs(
+             inputs_embeds=inputs_embeds,
+@@ -99,6 +121,12 @@
+             attention_mask=attention_mask,
+             group=ulysses_group,
+         )
++        if routed_experts is not None:
++            routed_experts, routed_expert_weights, router_replay_mask = (
++                split_tensor_to_group(pad_tensor_to_group(value, ulysses_group, dim=1, pad_value=0),
++                                      ulysses_group, dim=1)
++                for value in (routed_experts, routed_expert_weights, router_replay_mask)
++            )
+ 
+     outputs = self.language_model(
+         input_ids=None,
+@@ -111,9 +139,16 @@
+         output_hidden_states=output_hidden_states,
+         return_dict=True,
+         cache_position=cache_position,
++        routed_experts=routed_experts,
++        routed_expert_weights=routed_expert_weights,
++        router_replay_mask=router_replay_mask,
+         **kwargs,
+     )
+     hidden_states = outputs.hidden_states
++    if cp_gather_hidden_states and ulysses_size > 1:
++        if complete_labels is not None:
++            raise ValueError("VERL CP gather mode uses the external RL loss; labels must be None")
++        hidden_states = gather_fused_sequence_hidden_states(hidden_states, ulysses_group, complete_length)
+     logits = self.language_model.lm_head(hidden_states).float()
+ 
+     loss = None
+diff --git a/fsdp_turbo/modules/kda.py b/fsdp_turbo/modules/kda.py
+--- a/fsdp_turbo/modules/kda.py
++++ b/fsdp_turbo/modules/kda.py
+@@ -2,7 +2,7 @@
+ """Ulysses context parallelism for Kimi Delta Attention (KDA)."""
+ 
+ from functools import wraps
+-import importlib
++import inspect
+ 
+ import torch
+ import torch.distributed as dist
+@@ -64,14 +64,28 @@
+     return output
+ 
+ 
+-def _get_chunk_kda(module):
+-    modeling_module = importlib.import_module(type(module).__module__)
+-    chunk_kda = getattr(modeling_module, "chunk_kda", None)
+-    if not callable(chunk_kda):
+-        raise RuntimeError(
+-            f"KDA module {type(module).__module__}.{type(module).__name__} does not expose its chunk_kda kernel."
+-        )
+-    return chunk_kda
++def _get_chunk_kda(module, original_forward=None):
++    """Resolve the backend selected by the original modeling function.
++
++    FSDP2 changes the instance class to FSDPKimiDeltaAttention, whose
++    __module__ is a PyTorch implementation module. The modeling function's
++    globals remain attached to the loaded (possibly remote-code) module.
++    Prefer the pre-CP forward captured by the wrapper; use the MRO only for
++    callers that do not retain it. Never substitute a different KDA backend.
++    """
++    forwards = [original_forward] if original_forward is not None else []
++    forwards.extend(cls.__dict__.get("forward") for cls in type(module).__mro__)
++    for forward in forwards:
++        if forward is None:
++            continue
++        forward = inspect.unwrap(getattr(forward, "__func__", forward))
++        chunk_kda = getattr(forward, "__globals__", {}).get("chunk_kda")
++        if callable(chunk_kda):
++            return chunk_kda
++    raise RuntimeError(
++        f"KDA module {type(module).__module__}.{type(module).__name__} does not expose "
++        "a callable chunk_kda in its original forward or inherited modeling forwards."
++    )
+ 
+ 
+ def get_ulysses_kda_forward(original_forward, group):
+@@ -134,7 +148,7 @@
+         a_log = module.A_log[head_start:head_end]
+         dt_bias = module.dt_bias.view(module.num_heads, module.head_dim)[head_start:head_end].reshape(-1)
+ 
+-        output, _ = _get_chunk_kda(module)(
++        output, _ = _get_chunk_kda(module, original_forward)(
+             q=query,
+             k=key,
+             v=value,
+diff --git a/tests/unit_tests/distributed/context_parallel/kimi_kda_real_loader.py b/tests/unit_tests/distributed/context_parallel/kimi_kda_real_loader.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit_tests/distributed/context_parallel/kimi_kda_real_loader.py
+@@ -0,0 +1,45 @@
++"""Load the actual remote-code KDA class; never replace KDA or FSDP in tests."""
++import ast
++import functools
++import importlib
++import importlib.util
++import os
++from pathlib import Path
++import sys
++import types
++import typing
++
++import torch
++
++
++def load_real_kimi_module():
++    directory = os.environ.get("KIMI_KDA_TEST_MODEL_DIR")
++    if not directory:
++        raise RuntimeError("Set KIMI_KDA_TEST_MODEL_DIR to a staged remote-code directory")
++    directory = Path(directory)
++    for name in ("configuration_kimi_k3.py", "modeling_kimi_linear.py"):
++        if not (directory / name).is_file():
++            raise RuntimeError(f"Missing real remote-code file: {directory / name}")
++
++    # macOS has no Triton wheel. Import the original pure-Python cache helper
++    # without importing Triton's GPU driver module. KDA, convolution, norm,
++    # collectives, and fully_shard remain the actual implementations.
++    if importlib.util.find_spec("triton") is None:
++        repo = Path(__file__).resolve().parents[4]
++        source = repo / "fsdp_turbo/ops/triton/utils.py"
++        tree = ast.parse(source.read_text())
++        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
++                        and node.name == "tensor_cache")
++        namespace = dict(torch=torch, functools=functools, Optional=typing.Optional,
++                         Callable=typing.Callable, Any=typing.Any)
++        exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
++        helper = types.ModuleType("fsdp_turbo.ops.triton.utils")
++        helper.tensor_cache = namespace["tensor_cache"]
++        sys.modules.setdefault(helper.__name__, helper)
++
++    package_name = "_kimi_kda_native_test_remote"
++    if package_name not in sys.modules:
++        package = types.ModuleType(package_name)
++        package.__path__ = [str(directory)]
++        sys.modules[package_name] = package
++    return importlib.import_module(package_name + ".modeling_kimi_linear")
+diff --git a/tests/unit_tests/distributed/context_parallel/test_kda_native_fsdp_cp.py b/tests/unit_tests/distributed/context_parallel/test_kda_native_fsdp_cp.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit_tests/distributed/context_parallel/test_kda_native_fsdp_cp.py
+@@ -0,0 +1,163 @@
++"""Actual KimiDeltaAttention + native fully_shard + real CP collectives.
++
++The optional model-dir fixture supplies the checkpoint configuration and the
++verbatim modeling source. CPU uses the project's actual small-op kernels;
++NPU uses the backend selected by that same modeling module.
++"""
++import copy
++from datetime import timedelta
++from functools import wraps
++import importlib
++import os
++from pathlib import Path
++import tempfile
++import types
++
++import pytest
++import torch
++import torch.distributed as dist
++from torch.distributed.device_mesh import init_device_mesh
++from torch.distributed.fsdp import fully_shard
++import torch.multiprocessing as mp
++from torch.utils.checkpoint import checkpoint
++
++from fsdp_turbo.distributed.context_parallel.batch import gather_fused_sequence_hidden_states
++from fsdp_turbo.modules.kda import _get_chunk_kda, get_ulysses_kda_forward
++from kimi_kda_real_loader import load_real_kimi_module
++
++
++def _real_model(modeling, device):
++    config = modeling.KimiLinearConfig(
++        hidden_size=8 if device.type == "cpu" else 256,
++        num_hidden_layers=1,
++        num_attention_heads=2 if device.type == "cpu" else 4,
++        linear_attn_config={
++            "short_conv_kernel_size": 3,
++            "head_dim": 4 if device.type == "cpu" else 128,
++            "num_heads": 2 if device.type == "cpu" else 4,
++            "kda_layers": [1], "full_attn_layers": [],
++        },
++    )
++    model = modeling.KimiDeltaAttention(config, layer_idx=0).to(device)
++    # KDA leaves dt_bias to checkpoint loading; use finite deterministic values
++    # when constructing a small randomly initialized module without weights.
++    with torch.no_grad():
++        model.dt_bias.fill_(0.1)
++    return model
++
++
++def _worker(rank, init_path, recompute, with_mask, compare_legacy):
++    device_type = os.environ.get("KIMI_KDA_TEST_DEVICE", "cpu")
++    if device_type == "npu":
++        import torch_npu  # noqa: F401
++        torch.npu.set_device(rank)
++        device = torch.device("npu", rank)
++        backend = "hccl"
++    else:
++        device = torch.device("cpu")
++        backend = "gloo"
++    dist.init_process_group(backend, init_method=f"file://{init_path}", rank=rank, world_size=2,
++                            timeout=timedelta(seconds=180))
++    try:
++        modeling = load_real_kimi_module()
++        torch.manual_seed(123)
++        reference = _real_model(modeling, device)
++        model = copy.deepcopy(reference)
++        original_forward = modeling.KimiDeltaAttention.forward
++        model.forward = types.MethodType(get_ulysses_kda_forward(original_forward, dist.group.WORLD), model)
++        fully_shard(model, mesh=init_device_mesh(device_type, (2,)))
++        assert type(model).__name__ == "FSDPKimiDeltaAttention"
++        assert type(model).__module__ != modeling.__name__
++
++        if compare_legacy:
++            # Exact old lookup logic: this must reproduce the production error
++            # after the actual fully_shard call, not after a fake class rename.
++            wrong_module = importlib.import_module(type(model).__module__)
++            assert not callable(getattr(wrong_module, "chunk_kda", None))
++
++        assert _get_chunk_kda(model, original_forward) is modeling.chunk_kda
++        assert _get_chunk_kda(model) is modeling.chunk_kda
++
++        seq = 8 if device_type == "cpu" else 128
++        hidden = reference.hidden_size
++        # Generate on CPU then copy so both ranks get bit-identical inputs.
++        complete_input = torch.randn(2, seq, hidden).to(device).requires_grad_(True)
++        reference_input = complete_input.detach().clone().requires_grad_(True)
++        complete_mask = None
++        if with_mask:
++            complete_mask = torch.ones(2, seq, dtype=torch.long, device=device)
++            complete_mask[1, -(2 if device_type == "cpu" else 32):] = 0
++        local_input = complete_input[:, rank*(seq//2):(rank+1)*(seq//2)].contiguous()
++        local_mask = None if complete_mask is None else complete_mask[:, rank*(seq//2):(rank+1)*(seq//2)]
++
++        def run(x):
++            return model(x, attention_mask=local_mask)
++
++        def autocast():
++            from contextlib import nullcontext
++            return torch.autocast("npu", dtype=torch.bfloat16) if device_type == "npu" else nullcontext()
++
++        with autocast():
++            actual_local = checkpoint(run, local_input, use_reentrant=False) if recompute else run(local_input)
++            actual = gather_fused_sequence_hidden_states(actual_local, dist.group.WORLD, seq)
++            expected = reference(reference_input, attention_mask=complete_mask)
++        atol = float(os.environ.get("KIMI_KDA_TEST_ATOL", "2e-6" if device_type == "cpu" else "1e-3"))
++        rtol = float(os.environ.get("KIMI_KDA_TEST_RTOL", "2e-4" if device_type == "cpu" else "1e-2"))
++        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
++        actual.float().square().mean().backward()
++        expected.float().square().mean().backward()
++        max_grad_error = 0.0
++        for name, parameter in model.named_parameters():
++            ref_parameter = dict(reference.named_parameters())[name]
++            assert parameter.grad is not None and ref_parameter.grad is not None, name
++            actual_grad = parameter.grad.full_tensor()
++            max_grad_error = max(max_grad_error, (actual_grad-ref_parameter.grad).abs().max().item())
++            torch.testing.assert_close(actual_grad, ref_parameter.grad, atol=atol, rtol=rtol,
++                                       msg=lambda msg: name + ": " + msg)
++        input_grad = complete_input.grad.clone()
++        dist.all_reduce(input_grad)
++        input_grad /= 2
++        torch.testing.assert_close(input_grad, reference_input.grad, atol=atol, rtol=rtol)
++        if rank == 0:
++            print(f"NATIVE_KDA_PASS device={device_type} recompute={recompute} mask={with_mask} "
++                  f"runtime_class={type(model).__module__}.{type(model).__name__} "
++                  f"kernel={modeling.chunk_kda.__module__}.{modeling.chunk_kda.__name__} "
++                  f"max_output_abs={(actual-expected).abs().max().item():.9g} "
++                  f"max_parameter_grad_abs={max_grad_error:.9g}", flush=True)
++    finally:
++        dist.destroy_process_group()
++
++
++@pytest.mark.skipif(not os.environ.get("KIMI_KDA_TEST_MODEL_DIR"),
++                    reason="requires actual checkpoint remote-code files")
++@pytest.mark.parametrize("recompute", [False, True])
++@pytest.mark.parametrize("with_mask", [False, True])
++def test_real_kda_native_fsdp_cp_forward_backward(recompute, with_mask):
++    with tempfile.TemporaryDirectory() as directory:
++        mp.spawn(_worker, args=(str(Path(directory)/"init"), recompute, with_mask, True),
++                 nprocs=2, join=True)
++
++
++def test_original_forward_namespace_wins_and_decorators_unwrap():
++    selected = lambda: None
++    unrelated = lambda: None
++    namespace = {"chunk_kda": selected}
++    exec("def forward(self, x): return x", namespace)
++    original = namespace["forward"]
++    @wraps(original)
++    def decorated(*args, **kwargs):
++        return original(*args, **kwargs)
++    other_namespace = {"chunk_kda": unrelated}
++    exec("def forward(self, x): return x", other_namespace)
++    wrapped_type = type("FSDPKimiDeltaAttention", (torch.nn.Module,),
++                        {"forward": other_namespace["forward"], "__module__": "torch.distributed.fsdp"})
++    assert _get_chunk_kda(wrapped_type(), decorated) is selected
++    assert _get_chunk_kda(wrapped_type(), types.MethodType(decorated, wrapped_type())) is selected
++
++
++def test_missing_kernel_fails_without_backend_substitution():
++    class Missing(torch.nn.Module):
++        def forward(self, x):
++            return x
++    with pytest.raises(RuntimeError, match="original forward"):
++        _get_chunk_kda(Missing())
+diff --git a/tests/unit_tests/distributed/context_parallel/test_kimi_rl_cp.py b/tests/unit_tests/distributed/context_parallel/test_kimi_rl_cp.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit_tests/distributed/context_parallel/test_kimi_rl_cp.py
+@@ -0,0 +1,155 @@
++"""Two-rank CPU/Gloo checks of the real post-fusion CP/R3 bridge.
++
++The small decoder is intentionally deterministic; these tests isolate layout
++and FSDP-averaged gradients. They do not replace full Kimi NPU acceptance.
++"""
++import copy
++import tempfile
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++import torch
++import torch.distributed as dist
++import torch.multiprocessing as mp
++
++from fsdp_turbo.models.kimi import kimi_k3_cp as cp
++
++
++class _Decoder(torch.nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.proj = torch.nn.Linear(4, 4, bias=False, dtype=torch.float64)
++        self.lm_head = torch.nn.Linear(4, 11, bias=False, dtype=torch.float64)
++        self.last_routes = None
++
++    def forward(self, inputs_embeds, routed_experts=None, routed_expert_weights=None,
++                router_replay_mask=None, **kwargs):
++        self.last_routes = (routed_experts, routed_expert_weights, router_replay_mask)
++        h = self.proj(inputs_embeds).tanh()
++        if routed_experts is not None:
++            # Route identity and weights both affect the result, so a CP-row
++            # shift changes logits and gradients rather than just an assertion.
++            route = (routed_experts[..., 0, 0] + 1) * routed_expert_weights[..., 0, 0]
++            h = h * torch.where(router_replay_mask, route, 1).unsqueeze(-1)
++        return SimpleNamespace(hidden_states=h, past_key_values=None, attentions=None)
++
++
++class _Model(torch.nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.embed = torch.nn.Embedding(11, 4, dtype=torch.float64)
++        self.vision = torch.nn.Linear(4, 4, bias=False, dtype=torch.float64)
++        self.language_model = _Decoder()
++        self.mm_projector = None
++        self.config = SimpleNamespace(output_attentions=False, output_hidden_states=False,
++                                      use_return_dict=True, ignore_index=-100)
++
++    def get_input_embeddings(self):
++        return self.embed
++
++    def _extract_image_features(self, pixel_values, grid_thws):
++        return [self.vision(p) for p in pixel_values]
++
++    def _merge_input_ids_with_image_features(self, features, embeds, input_ids, mask, labels):
++        # Unequal image expansion and right padding, matching the Kimi layout
++        # used for image-expanded raw-token logit alignment.
++        merged = []
++        merged_masks = []
++        image_idx = 0
++        for ids, e, m in zip(input_ids, embeds, mask):
++            parts, masks = [], []
++            for token, row, valid in zip(ids, e, m):
++                if token == 10:
++                    image = features[image_idx]
++                    image_idx += 1
++                    parts.append(image)
++                    masks.append(valid.expand(image.shape[0]))
++                else:
++                    parts.append(row.unsqueeze(0))
++                    masks.append(valid.unsqueeze(0))
++            merged.append(torch.cat(parts))
++            merged_masks.append(torch.cat(masks))
++        max_len = max(t.shape[0] for t in merged)
++        h = torch.stack([torch.nn.functional.pad(t, (0, 0, 0, max_len-t.shape[0])) for t in merged])
++        m = torch.stack([torch.nn.functional.pad(t, (0, max_len-t.shape[0])) for t in merged_masks])
++        positions = (m.cumsum(-1)-1).masked_fill(m == 0, 1)
++        return h, m, labels, positions
++
++
++def _worker(rank, init_path, with_replay, recompute):
++    dist.init_process_group("gloo", init_method=f"file://{init_path}", rank=rank, world_size=2)
++    try:
++        torch.manual_seed(23)
++        model = _Model()
++        reference = copy.deepcopy(model)
++        ids = torch.tensor([[1, 10, 2, 3, 4], [5, 10, 6, 7, 0]])
++        mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 1, 0]])
++        # Fused lengths: 7 and 6 (5 valid). CP padding makes length 8.
++        images = [torch.randn(3, 4, dtype=torch.float64), torch.randn(2, 4, dtype=torch.float64)]
++        kwargs = dict(input_ids=ids, attention_mask=mask, pixel_values=images, use_cache=False,
++                      cp_gather_hidden_states=True)
++        if with_replay:
++            routes = torch.arange(2*6*2*2).reshape(2, 6, 2, 2) % 7
++            weights = torch.linspace(.1, .9, routes.numel(), dtype=torch.float64).reshape(routes.shape)
++            replay_mask = torch.tensor([[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 0, 0]], dtype=torch.bool)
++            kwargs.update(routed_experts=routes, routed_expert_weights=weights,
++                          router_replay_mask=replay_mask, r3_full_model_rows=True)
++        cp.get_ulysses_context = lambda: (None, 0, 1)
++        expected = cp.kimi_k3_model_forward(reference, **kwargs).logits
++        cp.get_ulysses_context = lambda: (dist.group.WORLD, rank, 2)
++        if recompute:
++            from torch.utils.checkpoint import checkpoint
++            original = model.language_model.forward
++            def decoder_forward(inputs_embeds, **decoder_kwargs):
++                hidden = checkpoint(lambda x: original(inputs_embeds=x, **decoder_kwargs).hidden_states,
++                                    inputs_embeds, use_reentrant=False)
++                return SimpleNamespace(hidden_states=hidden, past_key_values=None, attentions=None)
++            model.language_model.forward = decoder_forward
++        actual = cp.kimi_k3_model_forward(model, **kwargs).logits
++        torch.testing.assert_close(actual, expected, atol=1e-7, rtol=1e-7)
++        # The same raw-token positions include the last image row, a CP boundary
++        # and the final causal row. Padding and the last rolled target are masked.
++        raw_indices = torch.tensor([[0, 3, 4, 5, 6], [0, 2, 3, 4, 5]])
++        targets = torch.roll(ids, -1, 1)
++        valid = mask.bool().clone()
++        valid.scatter_(1, (mask.sum(-1)-1).unsqueeze(1), False)
++        def loss(logits):
++            logits = logits.gather(1, raw_indices[..., None].expand(-1, -1, 11))
++            logits = logits / logits.new_tensor([0.7, 1.2])[:, None, None]
++            lp = logits.log_softmax(-1).gather(-1, targets[..., None]).squeeze(-1)
++            entropy = -(logits.softmax(-1) * logits.log_softmax(-1)).sum(-1)
++            return -lp[valid].mean() + .03 * entropy[valid].mean()
++        loss(actual).backward()
++        loss(expected).backward()
++        for (name, parameter), (_, ref_parameter) in zip(model.named_parameters(), reference.named_parameters()):
++            averaged = parameter.grad.clone()
++            dist.all_reduce(averaged)
++            averaged /= 2
++            torch.testing.assert_close(averaged, ref_parameter.grad, atol=2e-7, rtol=2e-6,
++                                       msg=lambda msg: name + ": " + msg)
++        if with_replay:
++            # Align globally before slicing: terminal row is not replayed and
++            # CP padding must never activate a zero/default expert route.
++            routes, weights, replay = model.language_model.last_routes
++            assert routes.shape == (2, 4, 2, 2)
++            if rank == 1:
++                assert not replay[0, 2:].any()
++                assert not replay[1, 0:].any()
++    finally:
++        dist.destroy_process_group()
++
++
++@pytest.mark.parametrize("with_replay", [False, True])
++@pytest.mark.parametrize("recompute", [False, True])
++def test_cp2_matches_cp1_logits_and_fsdp_averaged_gradients(with_replay, recompute):
++    with tempfile.TemporaryDirectory() as tmp:
++        mp.spawn(_worker, args=(str(Path(tmp)/"init"), with_replay, recompute), nprocs=2, join=True)
++
++
++def test_reject_partial_replay(monkeypatch):
++    monkeypatch.setattr(cp, "get_ulysses_context", lambda: (None, 0, 1))
++    model = _Model()
++    with pytest.raises(ValueError, match="R3 requires"):
++        cp.kimi_k3_model_forward(model, input_ids=torch.tensor([[1, 2]]), use_cache=False,
++                                routed_experts=torch.zeros(1, 1, 1, 1, dtype=torch.long))
